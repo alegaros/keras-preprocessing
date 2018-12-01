@@ -537,70 +537,6 @@ def list_pictures(directory, ext='jpg|jpeg|bmp|png|ppm'):
             if re.match(r'([\w]+\.(?:' + ext + '))', f.lower())]
 
 
-class ImageDataGeneratorMultiOutput(ImageDataGenerator):
-
-    def __init__(self, *args, **kwargs):
-        super(ImageDataGeneratorMultiOutput, self).__init__(*args, **kwargs)
-
-    def flow(self, x, y=None, groups_idx=None, batch_size=32, shuffle=True,
-             sample_weight=None, seed=None,
-             save_to_dir=None, save_prefix='', save_format='png', subset=None):
-        """Takes data & label arrays, generates batches of augmented data.
-
-        # Arguments
-            x: Input data. Numpy array of rank 4 or a tuple.
-                If tuple, the first element
-                should contain the images and the second element
-                another numpy array or a list of numpy arrays
-                that gets passed to the output
-                without any modifications.
-                Can be used to feed the model miscellaneous data
-                along with the images.
-                In case of grayscale data, the channels axis of the image array
-                should have value 1, in case
-                of RGB data, it should have value 3, and in case
-                of RGBA data, it should have value 4.
-            y: Labels.
-            groups_idx: list of lists that contains the indices of each output.
-            batch_size: Int (default: 32).
-            shuffle: Boolean (default: True).
-            sample_weight: Sample weights.
-            seed: Int (default: None).
-            save_to_dir: None or str (default: None).
-                This allows you to optionally specify a directory
-                to which to save the augmented pictures being generated
-                (useful for visualizing what you are doing).
-            save_prefix: Str (default: `''`).
-                Prefix to use for filenames of saved pictures
-                (only relevant if `save_to_dir` is set).
-            save_format: one of "png", "jpeg"
-                (only relevant if `save_to_dir` is set). Default: "png".
-            subset: Subset of data (`"training"` or `"validation"`) if
-                `validation_split` is set in `ImageDataGenerator`.
-
-        # Returns
-            An `Iterator` yielding tuples of `(x, y)`
-                where `x` is a numpy array of image data
-                (in the case of a single image input) or a list
-                of numpy arrays (in the case with
-                additional inputs) and `y` is a numpy array
-                of corresponding labels. If 'sample_weight' is not None,
-                the yielded tuples are of the form `(x, y, sample_weight)`.
-                If `y` is None, only the numpy array `x` is returned.
-        """
-
-        return NumpyArrayIteratorMultiOutput(
-            x, y, self, groups_idx=groups_idx,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sample_weight=sample_weight,
-            seed=seed,
-            save_to_dir=save_to_dir,
-            save_prefix=save_prefix,
-            save_format=save_format,
-            subset=subset)
-
-
 class ImageDataGenerator(object):
     """Generate batches of tensor image data with real-time data augmentation.
      The data will be looped over (in batches).
@@ -943,7 +879,8 @@ class ImageDataGenerator(object):
     def flow(self, x,
              y=None, batch_size=32, shuffle=True,
              sample_weight=None, seed=None,
-             save_to_dir=None, save_prefix='', save_format='png', subset=None):
+             save_to_dir=None, save_prefix='', save_format='png', subset=None,
+             sampler=None):
         """Takes data & label arrays, generates batches of augmented data.
 
         # Arguments
@@ -975,6 +912,7 @@ class ImageDataGenerator(object):
                 (only relevant if `save_to_dir` is set). Default: "png".
             subset: Subset of data (`"training"` or `"validation"`) if
                 `validation_split` is set in `ImageDataGenerator`.
+            sampler: imblearn sampler.
 
         # Returns
             An `Iterator` yielding tuples of `(x, y)`
@@ -996,7 +934,8 @@ class ImageDataGenerator(object):
             save_to_dir=save_to_dir,
             save_prefix=save_prefix,
             save_format=save_format,
-            subset=subset)
+            subset=subset,
+            sampler=sampler)
 
     def flow_from_directory(self, directory,
                             target_size=(256, 256), color_mode='rgb',
@@ -1491,9 +1430,10 @@ class Iterator(IteratorType):
         batch_size: Integer, size of a batch.
         shuffle: Boolean, whether to shuffle the data between epochs.
         seed: Random seeding for data shuffling.
+        sampler: imblearn sampler.
     """
 
-    def __init__(self, n, batch_size, shuffle, seed):
+    def __init__(self, n, batch_size, shuffle, seed, sampler):
         self.n = n
         self.batch_size = batch_size
         self.seed = seed
@@ -1502,12 +1442,17 @@ class Iterator(IteratorType):
         self.total_batches_seen = 0
         self.lock = threading.Lock()
         self.index_array = None
-        self.index_generator = self._flow_index()
+        self.index_generator = self._flow_index(sampler)
 
-    def _set_index_array(self):
-        self.index_array = np.arange(self.n)
-        if self.shuffle:
+    def _set_index_array(self, sampler):
+        if sampler:
+            self.index_array = sampler.sample_indices_
+        else:
+            self.index_array = np.arange(self.n)
+        if self.shuffle and sampler is None:
             self.index_array = np.random.permutation(self.n)
+        elif self.shuffle and sampler is not None:
+            self.index_array = np.random.permutation(self.index_array)
 
     def __getitem__(self, idx):
         if idx >= len(self):
@@ -1583,14 +1528,14 @@ class Iterator(IteratorType):
     def reset(self):
         self.batch_index = 0
 
-    def _flow_index(self):
+    def _flow_index(self, sampler):
         # Ensure self.batch_index is 0.
         self.reset()
         while 1:
             if self.seed is not None:
                 np.random.seed(self.seed + self.total_batches_seen)
             if self.batch_index == 0:
-                self._set_index_array()
+                self._set_index_array(sampler)
 
             current_index = (self.batch_index * self.batch_size) % self.n
             if self.n > current_index + self.batch_size:
@@ -1621,58 +1566,68 @@ class Iterator(IteratorType):
         raise NotImplementedError
 
 
-class NumpyArrayIteratorMultiOutput(NumpyArrayIterator):
-    """Iterator yielding data from a Numpy array.
+class ImageDataGeneratorMultiOutput(ImageDataGenerator):
 
-    # Arguments
-        x: Numpy array of input data or tuple.
-            If tuple, the second elements is either
-            another numpy array or a list of numpy arrays,
-            each of which gets passed
-            through as an output without any modifications.
-        y: Numpy array of targets data.
-        image_data_generator: Instance of `ImageDataGenerator`
-            to use for random transformations and normalization.
-        groups_idx: list of lists that contains the indices of each output.
-        batch_size: Integer, size of a batch.
-        shuffle: Boolean, whether to shuffle the data between epochs.
-        sample_weight: Numpy array of sample weights.
-        seed: Random seed for data shuffling.
-        data_format: String, one of `channels_first`, `channels_last`.
-        save_to_dir: Optional directory where to save the pictures
-            being yielded, in a viewable format. This is useful
-            for visualizing the random transformations being
-            applied, for debugging purposes.
-        save_prefix: String prefix to use for saving sample
-            images (if `save_to_dir` is set).
-        save_format: Format to use for saving sample images
-            (if `save_to_dir` is set).
-        subset: Subset of data (`"training"` or `"validation"`) if
-            validation_split is set in ImageDataGenerator.
-        dtype: Dtype to use for the generated arrays.
-    """
+    def __init__(self, *args, **kwargs):
+        super(ImageDataGeneratorMultiOutput, self).__init__(*args, **kwargs)
 
-    def __init__(self, x, y, image_data_generator, groups_idx=None,
-                 batch_size=32, shuffle=False, sample_weight=None,
-                 seed=None, data_format='channels_last',
-                 save_to_dir=None, save_prefix='', save_format='png',
-                 subset=None, dtype='float32'):
-        self.groups_idx = groups_idx
-        super(NumpyArrayIteratorMultiOutput, self).__init__(x, y, image_data_generator,
-                                                            batch_size=batch_size,
-                                                            shuffle=shuffle,
-                                                            sample_weight=sample_weight,
-                                                            seed=seed,
-                                                            save_to_dir=save_to_dir,
-                                                            save_prefix=save_prefix,
-                                                            save_format=save_format,
-                                                            subset=subset)
+    def flow(self, x, y=None, groups_idx=None, batch_size=32, shuffle=True,
+             sample_weight=None, seed=None,
+             save_to_dir=None, save_prefix='', save_format='png', subset=None):
+        """Takes data & label arrays, generates batches of augmented data.
 
-    def _get_batches_of_transformed_samples(self, index_array):
-        output_tuple = super(NumpyArrayIteratorMultiOutput,
-            self)._get_batches_of_transformed_samples(index_array)
-        return output_tuple[0], [output_tuple[1][:, idx]
-            for idx in self.groups_idx]
+        # Arguments
+            x: Input data. Numpy array of rank 4 or a tuple.
+                If tuple, the first element
+                should contain the images and the second element
+                another numpy array or a list of numpy arrays
+                that gets passed to the output
+                without any modifications.
+                Can be used to feed the model miscellaneous data
+                along with the images.
+                In case of grayscale data, the channels axis of the image array
+                should have value 1, in case
+                of RGB data, it should have value 3, and in case
+                of RGBA data, it should have value 4.
+            y: Labels.
+            groups_idx: list of lists that contains the indices of each output.
+            batch_size: Int (default: 32).
+            shuffle: Boolean (default: True).
+            sample_weight: Sample weights.
+            seed: Int (default: None).
+            save_to_dir: None or str (default: None).
+                This allows you to optionally specify a directory
+                to which to save the augmented pictures being generated
+                (useful for visualizing what you are doing).
+            save_prefix: Str (default: `''`).
+                Prefix to use for filenames of saved pictures
+                (only relevant if `save_to_dir` is set).
+            save_format: one of "png", "jpeg"
+                (only relevant if `save_to_dir` is set). Default: "png".
+            subset: Subset of data (`"training"` or `"validation"`) if
+                `validation_split` is set in `ImageDataGenerator`.
+
+        # Returns
+            An `Iterator` yielding tuples of `(x, y)`
+                where `x` is a numpy array of image data
+                (in the case of a single image input) or a list
+                of numpy arrays (in the case with
+                additional inputs) and `y` is a numpy array
+                of corresponding labels. If 'sample_weight' is not None,
+                the yielded tuples are of the form `(x, y, sample_weight)`.
+                If `y` is None, only the numpy array `x` is returned.
+        """
+
+        return NumpyArrayIteratorMultiOutput(
+            x, y, self, groups_idx=groups_idx,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sample_weight=sample_weight,
+            seed=seed,
+            save_to_dir=save_to_dir,
+            save_prefix=save_prefix,
+            save_format=save_format,
+            subset=subset)
 
 
 class NumpyArrayIterator(Iterator):
@@ -1702,6 +1657,7 @@ class NumpyArrayIterator(Iterator):
             (if `save_to_dir` is set).
         subset: Subset of data (`"training"` or `"validation"`) if
             validation_split is set in ImageDataGenerator.
+        sampler: imblearn sampler.
         dtype: Dtype to use for the generated arrays.
     """
 
@@ -1709,7 +1665,7 @@ class NumpyArrayIterator(Iterator):
                  batch_size=32, shuffle=False, sample_weight=None,
                  seed=None, data_format='channels_last',
                  save_to_dir=None, save_prefix='', save_format='png',
-                 subset=None, dtype='float32'):
+                 subset=None, sampler=None, dtype='float32'):
         self.dtype = dtype
         if (type(x) is tuple) or (type(x) is list):
             if type(x[1]) is not list:
@@ -1792,10 +1748,13 @@ class NumpyArrayIterator(Iterator):
         self.save_to_dir = save_to_dir
         self.save_prefix = save_prefix
         self.save_format = save_format
+        if sampler:
+            sampler.fit_resample(x.reshape(x.shape[0], -1), y)
         super(NumpyArrayIterator, self).__init__(x.shape[0],
                                                  batch_size,
                                                  shuffle,
-                                                 seed)
+                                                 seed,
+                                                 sampler)
 
     def _get_batches_of_transformed_samples(self, index_array):
         batch_x = np.zeros(tuple([len(index_array)] + list(self.x.shape)[1:]),
@@ -1927,6 +1886,60 @@ def _list_valid_filenames_in_directory(directory, white_list_formats, split,
         filenames.append(relative_path)
 
     return classes, filenames
+
+
+class NumpyArrayIteratorMultiOutput(NumpyArrayIterator):
+    """Iterator yielding data from a Numpy array.
+
+    # Arguments
+        x: Numpy array of input data or tuple.
+            If tuple, the second elements is either
+            another numpy array or a list of numpy arrays,
+            each of which gets passed
+            through as an output without any modifications.
+        y: Numpy array of targets data.
+        image_data_generator: Instance of `ImageDataGenerator`
+            to use for random transformations and normalization.
+        groups_idx: list of lists that contains the indices of each output.
+        batch_size: Integer, size of a batch.
+        shuffle: Boolean, whether to shuffle the data between epochs.
+        sample_weight: Numpy array of sample weights.
+        seed: Random seed for data shuffling.
+        data_format: String, one of `channels_first`, `channels_last`.
+        save_to_dir: Optional directory where to save the pictures
+            being yielded, in a viewable format. This is useful
+            for visualizing the random transformations being
+            applied, for debugging purposes.
+        save_prefix: String prefix to use for saving sample
+            images (if `save_to_dir` is set).
+        save_format: Format to use for saving sample images
+            (if `save_to_dir` is set).
+        subset: Subset of data (`"training"` or `"validation"`) if
+            validation_split is set in ImageDataGenerator.
+        dtype: Dtype to use for the generated arrays.
+    """
+
+    def __init__(self, x, y, image_data_generator, groups_idx=None,
+                 batch_size=32, shuffle=False, sample_weight=None,
+                 seed=None, data_format='channels_last',
+                 save_to_dir=None, save_prefix='', save_format='png',
+                 subset=None, dtype='float32'):
+        self.groups_idx = groups_idx
+        super(NumpyArrayIteratorMultiOutput, self).__init__(x, y, image_data_generator,
+                                                            batch_size=batch_size,
+                                                            shuffle=shuffle,
+                                                            sample_weight=sample_weight,
+                                                            seed=seed,
+                                                            save_to_dir=save_to_dir,
+                                                            save_prefix=save_prefix,
+                                                            save_format=save_format,
+                                                            subset=subset)
+
+    def _get_batches_of_transformed_samples(self, index_array):
+        output_tuple = super(NumpyArrayIteratorMultiOutput,
+            self)._get_batches_of_transformed_samples(index_array)
+        return output_tuple[0], [output_tuple[1][:, idx]
+            for idx in self.groups_idx]
 
 
 class DirectoryIterator(Iterator):
